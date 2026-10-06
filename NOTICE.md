@@ -1,30 +1,31 @@
-# NOTICE
+# Notices
 
-This repository contains **deployment notes and measurements** for serving a DeepSeek-V4.1-Flash
-checkpoint with the TensorFold engine on two NVIDIA DGX Spark (GB10) systems. It does not redistribute
-model weights, engine source, or container images.
+DeepSeek-V4.1-Flash on DGX Sparks with TensorFold — deployment notes and measurements
+Copyright 2026 ZackO2o
 
-## Upstream components referenced
+This repository's own text, configuration excerpts and measurement scripts are licensed under the MIT License
+(see `LICENSE`). It does **not** redistribute model weights, engine source, container images, or third-party code.
 
-| Component | Owner | License (as published) |
-|---|---|---|
-| TensorFold (engine) | Ash Hart / ashhart | see the upstream repository |
-| 2x DGX Spark DeepSeek-V4.1-Flash recipe | jayleaton | Apache-2.0 (upstream project code) |
-| ExLlamaV3 (EXL3 format & kernels) | turboderp-org | see the upstream repository |
-| 2.9 bpw EXL3 weight pack | MiaAI-Lab | see the model card |
-| DeepSeek-V4.1-Flash (base model) | DeepSeek | see the model card |
+## Third-party work referenced
 
-The benchmark prompt texts quoted in README sections 2.1-2.2 are reproduced from the upstream recipe's
-own workload definitions so that the comparison is like-for-like; they are short programmatic prompts,
-not creative works.
+| Component | Project | License |
+| --- | --- | --- |
+| TensorFold (engine) | https://github.com/ashhart/TensorFold | Apache-2.0 from 0.6.0 (MIT before it); see the upstream repository |
+| 2x DGX Spark DeepSeek-V4.1 recipe | https://github.com/jayleaton/deepseek-v41-tensorfold-spark | Apache-2.0 (upstream project code) |
+| DeepSeek-V4.1-Flash (base model) | https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash | see the model card |
+| 2.9 bpw EXL3 pack family | https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw | see the model card |
+| exllamav3 (EXL3 format and kernels) | https://github.com/turboderp-org/exllamav3 | MIT |
 
-## Environment strings quoted
+## Quoted material
 
-Section 1.1 and 1.2 quote **error messages emitted by the upstream engine** (the memory-floor refusal and
-the KV-pool page refusal). They are reproduced verbatim because the exact wording is what makes those
-failure modes recognisable.
+- The benchmark prompt texts in the Performance section are short programmatic prompts reproduced from the
+  upstream recipe's own workload definitions, so that the numbers are comparable like-for-like.
+- Sections "Window and slots" and "KV pool and memory" quote **error messages emitted by the upstream engine**
+  (the memory-floor refusal and the KV-pool page refusal). They are reproduced verbatim because the exact wording
+  is what makes those failure modes recognisable.
+- Environment variable names and their meanings follow the upstream recipe's configuration file.
 
-## What this repository's own material is licensed under
+## No warranty
 
-MIT — see [LICENSE](LICENSE). That covers the text, the annotated configuration excerpts, and the
-measurement methodology described here. It does not cover any upstream component.
+These are field notes from one deployment. They are not a specification, they are not certified, and numbers will
+differ on other hardware, other clock settings, and other software revisions.
