@@ -1,310 +1,295 @@
----
-license: mit
-base_model: deepseek-ai/DeepSeek-V4.1-Flash
-tags:
-  - deepseek
-  - deepseek-v4.1-flash
-  - tensorfold
-  - dgx-spark
-  - gb10
-  - sm121
-  - tensor-parallel
-  - exl3
-  - fp8-kv
-  - engram
-  - speculative-decoding
-  - dspark
-  - 512k-context
-language:
-  - en
-  - zh
-pipeline_tag: text-generation
----
+<h1 align="center">DeepSeek-V4.1-Flash on DGX Sparks with TensorFold</h1>
 
-# DeepSeek-V4.1-Flash on 2× NVIDIA DGX Spark (GB10), TensorFold TP=2
-### 512K context · 3 concurrent slots · FP8 KV · exact DSpark speculative decoding · Engram read from local NVMe
+<p align="center">
+  <sub>by <a href="https://github.com/ZackO2o">ZackO2o</a></sub>
+</p>
 
-**中文版见 [README.zh-CN.md](README.zh-CN.md).**
+Serve **DeepSeek-V4.1-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB of unified memory each, linked by their
+ConnectX-7 ports) through an OpenAI-compatible API, with **4 concurrent requests**, a window of **400,000 tokens**
+per request, and a shared FP8 KV pool of **1,638,400 tokens**. It runs
+[TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 (pinned submodule, plus the two-Spark engine stack from
+the [2x DGX Spark DeepSeek-V4.1 recipe](https://github.com/jayleaton/deepseek-v41-tensorfold-spark), one rank on
+each Spark): EXL3 expert and dense kernels tuned for GB10, the CSA2 attention path with FP8 KV rows and the
+lightning indexer, Single-Pass mHC, Engram rows read from local NVMe, **exact** DSpark speculative decoding, CED
+bounded-replay prefill, several requests over one shared cache pool, native image input, structured output and tool
+calls, `/tokenize` and `/metrics`.
 
-This repository publishes our **as-deployed** configuration and every number we measured for serving
-DeepSeek-V4.1-Flash on **two GB10 systems ("DGX Spark", SM 12.1, 128 GB unified memory each)** with the
-[TensorFold](https://github.com/ashhart/TensorFold) engine, tensor-parallel across the single CX7 QSFP link.
+- Checkpoint: [`dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw`](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw),
+  the uncensored variant of the 2.9 bpw EXL3 pack (39 safetensors shards, ~197 GB, same layout as
+  [Mia-AiLab's pack](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw))
+- API model id: `DeepSeek-V4.1-Flash-TF`
+- Window: **400,000 tokens** a request, **4 requests at once**, sharing an FP8 KV pool of **1,638,400 tokens** (4.1x a full window)
+- Engram n-gram rows kept on each rank's local NVMe
+- `/tokenize`, `/detokenize`, Prometheus `/metrics`, tool calls, and `reasoning_effort` `low` / `high` / `max`
+- **Thinking defaults to off** (see [Thinking and sampling](#thinking-and-sampling)); a request turns it back on
+- A prepared per-rank layout: **ready in 53 s**, restarts included
 
-It is a field notebook, not a paper. The value is in the parts that were not obvious: which
-**context × slot combinations physically fit** on this pair, what the **KV pool** — not `max_model_len` —
-does to long requests, and how a **client-visible** measurement compares with an engine-internal one.
+## Performance
 
-Everything below was measured on our own pair, at the client, with prefix caching off unless noted.
+Two DGX Sparks at the deployed configuration (4 streams, 400,000-token window, FP8 KV cache, DSpark speculative
+decoding, thinking off), measured **through the HTTP API from the client side**, greedy, with prefix caching cold on
+every single-stream cell. Nothing else on the GPUs.
 
-| | |
-|---|---|
-| **Base model** | DeepSeek-V4.1-Flash (2.9 bpw EXL3 pack, 39 safetensors shards, ~197 GB) |
-| **Hardware** | 2 × GB10 / SM 12.1, 128 GB unified memory, 2 × 200 Gb/s CX7 (RoCE v2) |
-| **Engine** | TensorFold `v0.6.0` (pinned submodule) + the recipe's patch set, image built for GB10 |
-| **Parallelism** | TP = 2, one QSFP link, RoCE |
-| **KV cache** | FP8, shared pool sized in tokens |
-| **Deployed context** | **512,000 tokens** (`CONTEXT=512000`), **3 request slots** |
-| **KV pool (deployed)** | **1,638,400 tokens** = 3.2× a 512K request |
-| **Decode (512K profile)** | code **82.2** / prose **42.1** / structured **103.1** tok/s single stream; 3-way same-workload aggregate **104.0** |
-| **Prefill** | **1,810 tok/s** at a genuine 419,879-token prompt (232 s), needle hit |
-| **Quality gates** | needle hit at 214K → 599K → 855K; tool calls, structured JSON, chat all correct |
-| **Boot** | 47-55 s from cold to serving, per profile |
-| **License** | MIT for this repository's own material; the weights keep their own license |
+**Decode** (single stream, first token to last token; and the same at four requests at once)
 
----
+| Workload | 1 request | 4 requests, aggregate | 4 requests, per request |
+| --- | ---: | ---: | ---: |
+| Code (`LRUCache`, 384-token reply) | **81.8 tok/s** | **150.5 tok/s** | 38.8 tok/s |
+| Prose (400-word essay, 384-token reply) | 42.5 tok/s | 72.9 tok/s | 18.4 tok/s |
+| Structured (count 1-200, 384-token reply) | 101.5 tok/s | — | — |
+| Code, same prompt again (warm prefix) | 82.6 tok/s | — | — |
 
-## 1. The three things that actually matter
+TTFT on these single-stream cells is **299-433 ms**. Four requests at once are identical to the same requests served
+one at a time: the four slots finish within 0.2 s of each other (6.6 / 6.6 / 6.6 / 6.8 s for a 256-token reply), so
+the shared pool does not serialise them.
 
-### 1.1 Context and slots trade against each other — the fit check is a hard floor
+**Prefill** (cold prompts, unique prefixes, a needle planted mid-document)
 
-The engine solves memory for `CONTEXT × PARALLEL` at boot and refuses to start when the remaining
-headroom drops under a hard floor (`TF_DSV41_FLOOR_HARD_GIB`, default **4.0 GiB**). The error text names the
-number, so the ladder is quick to walk — but it means **"longer context" and "more concurrency" are a trade,
-not two independent knobs**:
+| Prompt | Prefill | Time to first token | Needle |
+| ---: | ---: | ---: | --- |
+| 214,319 tokens | 1,921 tok/s | 111.6 s | found |
+| 257,310 tokens | 1,878 tok/s | 137.0 s | found |
+| 291,719 tokens | 1,667 tok/s | 175.0 s | found |
+| 325,889 tokens | 1,899 tok/s | 171.6 s | found |
+| 368,640 tokens | 1,859 tok/s | 198.3 s | found |
 
-| profile | outcome |
-|---|---|
-| `CONTEXT=300000 PARALLEL=4` | boots, `request slots: 4`, ready 55 s |
-| `CONTEXT=400000 PARALLEL=4` | boots, ready 55 s |
-| `CONTEXT=500000 PARALLEL=4` | **refused** — `4 x 500000 on rank 0 leaves 3.90 GiB, under the 4.0 GiB hard floor; fit: 3 stream(s)` |
-| **`CONTEXT=512000 PARALLEL=3`** | **boots, `request slots: 3`, ready 53 s ← deployed** |
-| `CONTEXT=600000 PARALLEL=1` | boots, ready 47 s |
-| `CONTEXT=1000000 PARALLEL=1` | boots, ready 47-57 s |
-| `CONTEXT=1000000 PARALLEL=4` | **refused** — `4 x 1000000 on rank 0 leaves 0.56 GiB, under the 4.0 GiB hard floor; fit: 1 stream(s)` |
+**Longer windows** (same pair, other profiles; see [Window and slots](#window-and-slots))
 
-So on one pair: **512K is a 3-slot profile**, and anything at 4 slots has to stay at or below 400K.
-There is no configuration on this hardware that gives both 1M *and* four concurrent slots — the
-2-GPU pair simply runs out of unified memory.
+| Window | Prompt | Prefill | Needle |
+| ---: | ---: | ---: | --- |
+| 500,000 x 3 | 454,053 tokens | 1,738 tok/s | found |
+| 600,000 x 1 | 599,310 tokens | 1,624 tok/s | found |
+| 1,000,000 x 1 | 855,600 tokens | 1,431 tok/s | found |
 
-### 1.2 The KV **pool** is what refuses long requests, not `max_model_len`
+**Context** (how a request that does not fit is refused, and what the real limit is)
 
-`TF_DSV41_POOL_TOKENS` is a total token budget for the shared pool, independent of the slot count.
-Long requests fail against the *pool*, and the error says "pool pages", which reads like a context error
-at first glance:
-
-```
-$ CONTEXT=1000000 PARALLEL=1 POOL_TOKENS=614400        # 2400 pages
-{"error": {"message": "the request needs 3343 KV pool pages, the pool has 2400"}}
-$ CONTEXT=1000000 PARALLEL=1 POOL_TOKENS=1228800       # pool doubled
-→ 855,600-token request served in 598 s, prefill 1,431 tok/s, needle hit
+```json
+{"error": {"message": "This model's maximum context length is 400000 tokens. However, you requested
+1000004 tokens (5 in the messages, 999999 in the completion). Please reduce the length of the messages
+or completion."}}
 ```
 
-Rule of thumb that has held on this pair: **pool ≥ slots × context + reply budget**. Deployed profile uses
-`1,638,400` for 3 × 512K. When a long request 400s at a length that looks comfortably inside
-`max_model_len`, read the pool number before touching the context.
+## Requirements
 
-### 1.3 Client-visible vs engine-internal throughput
+- **Two DGX Sparks** (or two GB10 systems with 128 GB unified memory), with nothing else large on their GPUs: the
+  server holds roughly **101 GiB** of weights and leaves single-digit GiB available. Stop other GPU work.
+- **A direct ConnectX-7 link:** a QSFP cable between the CX7 ports and an IPv4 address on each end in one private
+  subnet (`ping` must work), with a RoCE v2 GID. One cabled CX7 port of a Spark reaches the GB10 over two PCIe Gen5
+  x4 links, so it appears as two netdevs and two RoCE devices; address both twins, in the link's subnet or each in
+  its own — both are then used, and the ranks' exchanges ride both rails.
+- **Key-based ssh** from the first Spark (the head, which runs the launcher and the API) to the second (the worker):
+  `ssh-copy-id user@<worker>`; check with `ssh -o BatchMode=yes user@<worker> true`.
+- Docker with the NVIDIA container runtime, and `rsync`, on both Sparks.
+- **Disk, on each Spark:** the checkpoint (~197 GB) and the Engram shards prepared locally, plus the image under
+  Docker's root. Prepared per-rank folders are what make the 53 s restarts possible.
+- A Hugging Face token only if you also want to pull weights yourself: this deployment reads the local cache.
 
-The upstream recipe reports single-stream numbers from an **in-engine benchmark** (`m2bench`) — no HTTP
-server in the loop. Serving over HTTP adds the stack, so the same workload measures lower at the client.
-Both are legitimate; mixing them produces the wrong conclusion ("we are half as fast as upstream").
-Our tables below are **client-side, over HTTP**, and upstream's are labelled as theirs.
+## Quick start
 
-When comparing, also pin down whether the cell is *first-token-to-last-token* (decode-only) or
-prompt-inclusive end-to-end. A 384-token reply with a 300 ms TTFT reads ~6 % lower if you count the
-prompt, and much lower on a long prompt.
+On the head:
 
----
+```bash
+git clone https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git
+cd deepseek-v41-tensorfold-spark
+cp config/prod.env.example config/prod.env      # then set your paths in it
+scripts/serve.sh build && scripts/serve.sh preflight && scripts/serve.sh start
+```
 
-## 2. Measured: the deployed 512K × 3 profile
-
-Prompt texts are the upstream benchmark's own (`CODE` = an O(1) LRU cache class; `PROSE` = a 400-word
-essay on lighthouses; `STRUCTURED` = "count 1 to 200"), 384-token replies, greedy, thinking off.
-
-### 2.1 Single stream
-
-| workload | T = 0 | T = 0.7 (warm prefix) |
-|---|---:|---:|
-| `CODE` | **78.3** tok/s | **82.2** tok/s |
-| `PROSE` | 40.5 tok/s | 42.1 tok/s |
-| `STRUCTURED` | 98.6 tok/s | 103.1 tok/s |
-
-TTFT in these runs was 0.26-0.35 s, so the numbers are decode-dominated, not prefill-dominated.
-
-### 2.2 Concurrency (same-workload, so no workload skew)
-
-| | aggregate |
-|---|---:|
-| 3 × `CODE`, identical prompt + one-line suffix each | **104.0** tok/s (per-slot wall 3.6 / 3.7 / 3.7 s — no serialisation) |
-| 3 × mixed (`CODE` / `PROSE` / `STRUCTURED`) | 75.4 tok/s |
-
-The same-workload cell is the honest one for "does the pool serialise?" — all three slots finish within
-0.1 s of each other. A mixed cell is dominated by whichever prompt runs longest, and a
-prompt that terminates early drags the measurement window out; publish both or the number misleads.
-
-### 2.3 Long context
-
-A genuine long request with a needle planted mid-document:
-
-| prompt tokens | result | wall | prefill | needle |
-|---:|---|---:|---:|---|
-| **419,879** (deployed 512K profile) | served | 232.0 s | **1,810 tok/s** | **hit** |
-| 214,319 | served | 111.6 s | 1,921 tok/s | hit |
-| 291,719 | served | 175.0 s | 1,667 tok/s | hit |
-| 411,362 | served | 232.0 s | 1,774 tok/s | hit |
-| 582,210 (600K profile) | served | 354.6 s | 1,642 tok/s | hit |
-| 599,310 (600K profile) | served | 369.0 s | 1,624 tok/s | hit |
-| 855,600 (1M profile) | served | 597.8 s | 1,431 tok/s | hit |
-
-Prefill degrades gently — roughly 1.9K tok/s at 200K down to 1.4K tok/s at the 1M end — and retrieval held
-at every length. **Plan the client timeout around prefill**: a 512K prompt is ~4 minutes before the first
-token, a 1M prompt ~10 minutes. Stream if the client UI needs to show progress.
-
-### 2.4 Boot
-
-| profile | time to serving |
-|---|---:|
-| 512K × 3 (deployed) | **53 s** |
-| 400K × 4 | 55 s |
-| 600K × 1 / 1M × 1 | 47 s |
-
-A prepared per-rank layout and cached compiled kernels are what make sub-minute restarts possible; a cold
-build is a different story.
-
----
-
-## 3. Configuration (deployed)
-
-Selected settings from the production environment file — the values are the interesting part, the file is
-otherwise paths and paths:
+The deployed window is set in `config/prod.env` (see [Configuration](#configuration)):
 
 ```ini
-CONTEXT=512000
-PARALLEL=3
-KV_DTYPE=fp8
-MAX_TOKENS=32768
-
-# KV pool: total tokens, independent of slots
+CONTEXT=400000
+PARALLEL=4
 TF_DSV41_POOL_TOKENS=1638400
-
-# memory floors: soft refusal / hard boot refusal (GiB)
-TF_DSV41_FLOOR_GIB=5
-TF_DSV41_FLOOR_HARD_GIB=4
-
-# prefill strategy: bounded replay with adaptive rows
-TF_DSV41_PREFILL=replay
-TF_DSV41_PREFILL_CHUNK=2048
-TF_DSV41_PREFILL_ROWS=2048
-TF_DSV41_PREFILL_ADAPT_GIB=4.5
-TF_DSV41_PREFILL_KERNELS=fast
-TF_DSV41_PREFILL_GATHER=bf16
-TF_DSV41_PREFILL_ROUTER=gemv
-
-# decode path
-TF_DSV41_SPEC_DRAFT=1            # exact speculative decoding
-TF_DSV41_GRAPH_MODE=rows
-TF_DSV41_MHC_CUDA=1
-TF_DSV41_ATTN_CUDA=1
-TF_DSV41_DENSE_V3=1
-TF_DSV41_DENSE=0
-TF_DSV41_ROUTER=gemv
-TF_DSV41_L2PF=1
-TF_DSV41_L2PF_MB=12
-TF_DSV41_L2PF_PACE_GBPS=150
-TF_DSV41_CALIB=real
-
-# cross-rank plan transport
-TF_DSV41_PLAN_LINK=nccl
-
-# serving default: thinking off (see §4)
-TF_DSV41_THINKING=0
-TF_DSV41_DEFAULT_EFFORT=high
 ```
 
-Two of these deserve a warning:
+Any OpenAI client works with `base_url = "http://<head-address>:8300/v1"` and the model
+`DeepSeek-V4.1-Flash-TF`:
 
-* **`TF_DSV41_PLAN_LINK=rdma` does not boot in the shipped image.** The upstream example sets it, but the
-  validator in the release we run accepts only `nccl` or `tcp` and aborts the start. We run `nccl`, and
-  measured `nccl` clearly ahead of `tcp` (4-way code aggregate 148.8 vs 135.7 tok/s in an A/B on the same
-  profile). Reported upstream.
-* **Calibration and prefix tiers assume a prepared layout.** `TF_DSV41_CALIB=real` expects a calibration
-  directory from a previous run; on a cold box it silently costs a slow first boot.
+```bash
+curl -s http://<head-address>:8300/v1/models
+curl -s http://<head-address>:8300/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "DeepSeek-V4.1-Flash-TF",
+  "messages": [{"role": "user", "content": "Write a Python fibonacci function."}],
+  "max_tokens": 2000
+}'
+curl -s http://<head-address>:8300/health        # inflight, streams, pool figures
+```
 
----
+`/health` on the deployed pair, idle:
 
-## 4. Thinking default: `content` is empty unless the client opts out
+```json
+{"ok": true, "inflight": 0, "requests_running": 0, "streams": {"decoding": 0, "prefilling": 0, "max": 4},
+ "context_length": 400000, "backend": "tensorfold"}
+```
 
-This one cost us a debugging round, so it is written down. With the server default effort at `high`, a
-prose/short-answer request with a bounded `max_tokens` spends the entire budget inside the reasoning
-channel and returns **an empty `content` string**:
+**Thinking off by default.** The server ships with thinking off, so the reply is in `content`. A request can ask it
+to think (see [Thinking and sampling](#thinking-and-sampling)) — give it enough `max_tokens` when it does.
 
-| request | result |
-|---|---|
-| `PROSE`, `max_tokens=1200`, no thinking kwargs | `content=""`, reasoning channel 5,918-13,755 chars, `finish_reason=length` |
-| same, `effort = low / high / max` × `max_tokens = 1200 / 3000` — six combinations | **all six** `content=""`, `finish_reason=length` |
-| same, thinking explicitly disabled | `content` 3,000+ chars / ~740 words, `finish_reason=stop` |
+## Window and slots
 
-A client that omits the thinking flag therefore sees an empty reply and retries — paying another prefill
-each time. We run the server with thinking **off by default** and let a request turn it back on; a
-side effect on this workload was single-stream code decode 55.6 → 77.6 tok/s, because the thinking budget
-had been consuming the same reply cap.
+The engine solves memory for `CONTEXT x PARALLEL` at boot and refuses to start when the remaining headroom drops
+under a hard floor (`TF_DSV41_FLOOR_HARD_GIB`, 4.0 GiB). The refusal names the shortfall, so the ladder below is
+what one pair of Sparks can actually do — **window and slots trade against each other**:
 
-Accuracy on the checks we run did not move with thinking off: arithmetic, a word-problem trap, a small
-equation, and the tool-call path all returned the expected answers. Multi-step math and hard debugging are
-where an explicit thinking budget is still the better choice — turn it on per request for those.
+| Window per request | Requests at once | Boot | Note |
+| ---: | ---: | --- | --- |
+| 300,000 | 4 | 55 s | |
+| **400,000** | **4** | **53 s** | **deployed** |
+| 500,000 | 3 | 52 s | |
+| 500,000 | 4 | refused | `4 x 500000 on rank 0 leaves 3.90 GiB, under the 4.0 GiB hard floor; fit: 3 stream(s)` |
+| 600,000 | 1 | 47 s | |
+| 1,000,000 | 1 | 47 s | |
+| 1,000,000 | 4 | refused | `4 x 1000000 on rank 0 leaves 0.56 GiB, under the 4.0 GiB hard floor; fit: 1 stream(s)` |
 
----
+On one pair, **500K is a 3-slot profile and 1M is a single-slot profile**; there is no configuration that gives
+both a 1M window and four concurrent slots. More simultaneous long requests need more Sparks, not more tuning.
 
-## 5. Operations
+### Profile switching
 
-* **Boot supervision**: run the server as a **systemd user unit** with lingering enabled, plus a
-  short-interval watchdog unit that re-checks health and restarts on failure. A prepared per-rank layout
-  means restarts land in well under a minute, so an unattended box recovers on its own.
-* **Profile switching**: keep one environment file per profile (300K×4, 400K×4, 512K×3, 600K×1, 1M×1) and
-  switch by swapping the file and restarting — a small wrapper that edits three settings
-  (`CONTEXT`, `PARALLEL`, `POOL_TOKENS`), archives the result, restarts and reports whether the boot
-  succeeded is enough. Because a refused boot prints the exact shortfall, the wrapper can report
-  "cannot fit" instead of leaving a silent dead service.
-* **Memory is the binding constraint, always.** With weights resident, available memory at serving time is
-  single-digit GiB. Watch it on both ranks; a long request admitted while another is decoding is what
-  pushes it to the floor.
-* **Client timeouts must exceed prefill.** Server-side, a long request holds its slot for minutes; if the
-  client side cuts at 60 s, the visible behaviour is a timeout even though the engine is working.
+Keep one environment file per profile and swap it. Editing three settings is enough:
 
----
+```ini
+CONTEXT=512000        # a longer window...
+PARALLEL=3            # ...one fewer slot
+TF_DSV41_POOL_TOKENS=1638400
+```
 
-## 6. How these numbers were taken
+Restart and read the boot line: `ready after Ns` plus `request slots: N` means it took; `start failed` plus a
+`fit:` line means it does not fit on your pair. Because the refusal states the exact shortfall, a wrapper can report
+"does not fit" instead of leaving a dead service behind. Profiles verified on this pair:
+`300K x 4`, `400K x 4`, `500K x 3`, `512K x 3`, `600K x 1`, `1M x 1`.
 
-* One pair, idle — nothing else on the GPUs. A shared GPU invalidates everything below.
-* `greedy` (`temperature 0`), `max_tokens` fixed per cell, **prefix caching off on single-stream cells**
-  (unique prompts) and explicitly noted where a warm-prefix cell is shown.
-* Token counts come from the response's `usage` block, never from counting streamed deltas — under
-  speculative decoding a single streamed chunk can carry several tokens.
-* Decode rates are **first-token-to-last-token**; the prompt/TTFT span is reported separately as prefill.
-* Boot timings are wall clock from process start to a successful `/v1/models` on the local port.
-* Quality checks are the ones quoted in the text: a needle planted mid-document at each long-context
-  length, arithmetic, a trap word problem, an equation, a JSON schema case and a tool call.
+## KV pool and memory
 
-Things we know are **not** settled by this repository:
+With `PARALLEL` above 1, all requests draw their per-token caches from **one shared pool**, sized in tokens by
+`TF_DSV41_POOL_TOKENS`:
 
-* The gap to the upstream engine-internal table is not fully explained; the largest residual is on the
-  structured/counting workload, and the missing cross-rank transport branch (§3) is our leading candidate.
-* Concurrency at 1M on one pair is impossible (§1.1). More simultaneous 1M sessions need more hardware,
-  not more tuning.
-* The 512K × 3 profile was measured after a fresh boot; we have not yet run a multi-hour soak on it.
+| | Deployed |
+| --- | ---: |
+| Requests at once (`PARALLEL`) | 4 |
+| Window per request (`CONTEXT`) | 400,000 tokens |
+| KV precision | FP8 |
+| **Shared pool** | **1,638,400 tokens** (4.1x a full window) |
+| Rank 0's weight footprint | ~101 GiB |
+| `MemAvailable` at serving | single-digit GiB, both ranks |
+| Boot to `/v1/models` | 53 s |
 
----
+Any one request can grow to the full window, and the four together share the pool. **The pool is the binding knob,
+not `max_model_len`** — a request larger than the pool is refused with a message about *pool pages*:
 
-## 7. Credits
+```
+CONTEXT=1000000 PARALLEL=1 POOL_TOKENS=614400                # sized for 4 x 300K
+{"error": {"message": "the request needs 3343 KV pool pages, the pool has 2400"}}
+CONTEXT=1000000 PARALLEL=1 POOL_TOKENS=1228800               # doubled
+→ 855,600-token request served in 598 s, prefill 1,431 tok/s, needle found
+```
 
-This deployment stands on other people's work, and the interesting ideas are theirs:
+Rule of thumb that has held here: **pool >= slots x window + reply budget**. When a long request is refused at a
+length that looks comfortably inside `CONTEXT`, read the pool number before touching the window.
 
-* **TensorFold** (Ash Hart) — the engine: EXL3 kernels, the server, the drafting path this recipe builds on.
-* **The 2× DGX Spark DeepSeek-V4.1-Flash recipe** (jayleaton) — the two-Spark engine stack, the DeepSeek-V4.1
-  family implementation, prepared per-rank folders, the benchmark definitions we re-used verbatim, and the
-  public issue discussion that fixed the packaging and memory-leak problems we hit.
-* **MiaAI-Lab** — the 2.9 bpw EXL3 pack and the vLLM kit that serves as the baseline in the upstream tables.
-* **ExLlamaV3** (turboderp and contributors) — the EXL3 format.
-* **DeepSeek** — the model, its technical report, and the DSpark / Engram lines of work the drafting and
-  n-gram paths implement.
-* The benchmark prompts in §2 are quoted from the upstream recipe's own workload definitions so the
-  comparisons are like-for-like.
+## Configuration
 
-**What this repository adds**: the 512K × 3 profile and its measurements, the slot-scaling fit ladder on
-this exact pair, the pool-vs-context failure mode with reproductions, and the client-side
-comparison methodology.
+Every setting lives in `config/prod.env` (copied from `config/prod.env.example`). The deployed values:
 
-## 8. License
+| Variable | Value | Meaning |
+| --- | ---: | --- |
+| `CONTEXT` | `400000` | prompt + reply window per request |
+| `PARALLEL` | `4` | requests decoded together |
+| `KV_DTYPE` | `fp8` | KV cache precision |
+| `MAX_TOKENS` | `32768` | reply budget of a request that sets no `max_tokens` |
+| `TF_DSV41_POOL_TOKENS` | `1638400` | shared pool, in tokens |
+| `TF_DSV41_FLOOR_GIB` / `_HARD_GIB` | `5` / `4` | soft warning / hard boot refusal, GiB |
+| `TF_DSV41_PREFILL` | `replay` | bounded-replay prefill (CED), the default |
+| `TF_DSV41_PREFILL_CHUNK` / `_ROWS` | `2048` | prefill rows per chunk |
+| `TF_DSV41_PREFILL_ADAPT_GIB` | `4.5` | adaptive row count target |
+| `TF_DSV41_PREFILL_KERNELS` | `fast` | prompt-row kernels (`exact` for bit-identical gates) |
+| `TF_DSV41_PREFILL_ROUTER` / `TF_DSV41_ROUTER` | `gemv` | router path |
+| `TF_DSV41_SPEC_DRAFT` | `1` | exact DSpark speculative decoding |
+| `TF_DSV41_GRAPH_MODE` | `rows` | CUDA graph capture mode |
+| `TF_DSV41_MHC_CUDA` / `_ATTN_CUDA` / `_DENSE_V3` | `1` | the three kernel rewrites of the upstream tuning |
+| `TF_DSV41_L2PF` / `_MB` / `_PACE_GBPS` | `1` / `12` / `150` | L2 prefetch of the next kernels' weights |
+| `TF_DSV41_CALIB` | `real` | calibration from a previous run |
+| `TF_DSV41_PLAN_LINK` | `nccl` | cross-rank plan transport |
+| `TF_DSV41_THINKING` | `0` | thinking off by default |
+| `TF_DSV41_DEFAULT_EFFORT` | `high` | effort used when a request turns thinking on |
 
-MIT for this repository's own text, configuration and measurement scripts. Model weights and upstream
-components keep their respective licenses; see [NOTICE.md](NOTICE.md) and [CREDITS.md](CREDITS.md).
+Two warnings:
+
+- **`TF_DSV41_PLAN_LINK=rdma` does not boot in the release we run.** `config/prod.env.example` sets `rdma`, but the
+  shipped validator accepts only `nccl` or `tcp` and aborts the start:
+  `tensorfold: TF_DSV41_PLAN_LINK='rdma': expected nccl or tcp` then `[dsv41-tf] start failed`. We run `nccl`, and
+  measured `nccl` ahead of `tcp` on the same profile (4-way code aggregate 148.8 vs 135.7 tok/s). Reported upstream.
+- **`TF_DSV41_CALIB=real` expects a calibration directory** from a previous run; on a cold box it silently costs a
+  slow first boot.
+
+## Thinking and sampling
+
+| Request | Result |
+| --- | --- |
+| Prose, `max_tokens=1200`, no thinking flag | `content=""` (empty), reasoning channel 5,918-13,755 chars, `finish_reason=length` |
+| Same, `effort` `low` / `high` / `max` x `max_tokens` 1200 / 3000 — six combinations | **all six** `content=""`, `finish_reason=length` |
+| Same, thinking disabled | `content` 3,000+ chars (~740 words), `finish_reason=stop` |
+
+A client that sends no thinking flag therefore sees an empty reply and retries, paying another prefill each time.
+**We run the server with thinking off by default** (`TF_DSV41_THINKING=0`) and let a request turn it on:
+
+```json
+{"chat_template_kwargs": {"enable_thinking": true}}          // think for this request
+{"reasoning_effort": "low" | "high" | "max"}                 // effort when thinking
+```
+
+Turning thinking off did not change the checks we run: arithmetic, a word-problem trap, a small equation, a JSON
+schema case and a tool call all returned the expected answers, and the reply lands in `content` instead of
+`reasoning_content`. Side effect on this workload: single-stream code decode **55.6 -> 81.8 tok/s**, since the
+thinking budget had been consuming the same reply cap. **Multi-step math and hard debugging are where an explicit
+thinking budget still wins** — turn it on per request for those.
+
+Sampling: `temperature`, `top_p`, `top_k`, `min_p` and `seed` are per request; `temperature: 0` decodes greedily,
+which is how every number above was measured. Without a `seed` the sampler's key comes from the prompt, so the same
+request gives the same reply.
+
+## How these numbers were taken
+
+- One pair, idle — nothing else on the GPUs. A shared GPU invalidates all of it.
+- Greedy (`temperature 0`), a fixed `max_tokens` per cell, **prefix caching cold on single-stream cells** (unique
+  prompts); the warm-prefix cell is labelled as such.
+- Token counts come from the response's `usage` block, never from counting streamed deltas: under speculative
+  decoding one streamed chunk can carry several tokens.
+- Decode rates are **first token to last token** (the upstream engine's own definition); TTFT is reported
+  separately, and prefill is prompt tokens / wall clock for a cold prompt.
+- Aggregate cells use a **shared clock across the concurrent requests**, the same `max_tokens` on all of them, and
+  the same prompt on every slot (a one-line suffix each) so no workload skews the window.
+- Boot time is wall clock from container start to a successful `/v1/models` on the local port.
+- Quality: a needle planted mid-document at every long-context length above, arithmetic, a trap word problem, an
+  equation, a JSON schema case and a tool call.
+
+Known limits, stated rather than hidden:
+
+- **A comparison against an upstream table is not apples to apples unless you match the paths.** The upstream
+  recipe reports its single-stream cells from an *in-engine* benchmark (`m2bench`, no HTTP server in the loop);
+  everything here is what a client sees over HTTP. On the same prompts we measure 90-106% of its cells
+  (code 82.6 vs 78.15 at a warm prefix; structured 102.4 vs 122.91), and the residual is presumably the HTTP hop
+  plus the shared pool's scheduling. Say which path a number came from or the comparison misleads.
+- The gap on the structured/counting workload is the widest of the set and we have no complete explanation for it;
+  the `PLAN_LINK` branch missing from the release (above) is our leading candidate.
+- 1M with concurrent slots is impossible on one pair (see [Window and slots](#window-and-slots)).
+- The 400K x 4 profile has been through multi-hour use, but this repository does not claim a formal soak test.
+
+## Repository layout
+
+```
+README.md          this file
+README.zh-CN.md    the same, in Chinese
+REDACTION-MAP.md   what was scanned before publishing, and what the numbers are allowed to say
+CREDITS.md         who and what this builds on
+NOTICE.md          third-party notices that go with the MIT license
+LICENSE            MIT (this repository's own material)
+tools/bench.py     the client-side benchmark: single stream, N-way aggregate, long-context needle
+```
+
+## License
+
+MIT for this repository's own text, configuration and measurement scripts, see [`LICENSE`](LICENSE).
+Model weights, the engine and the upstream recipe keep their own licenses, and nothing of theirs is redistributed
+here; see [`NOTICE.md`](NOTICE.md) and [`CREDITS.md`](CREDITS.md).
