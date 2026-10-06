@@ -1,46 +1,45 @@
-# CREDITS
+# Credits
 
-This deployment is built on other people's work. The engine, the model, the quantisation format and the
-cross-project recipe are theirs; what is ours is the measured profile and the notes in the README.
+This repository is a measured deployment note. The engine, the model, the quantisation format and the
+cross-project recipe were built by others; what is ours is the profile, the numbers, and the notes about what does
+not fit.
 
-## Direct foundations
+## Model
 
-* **TensorFold** — https://github.com/ashhart/TensorFold
-  The engine that serves this model: EXL3 kernels, the server, the drafting path. Pinned as a submodule
-  in the upstream recipe we deploy.
+- **DeepSeek-V4.1-Flash** by DeepSeek — the model, its technical report, and the DSpark speculative decoding and
+  Engram n-gram lines of work that this stack implements. Its license, on the model card, governs any use of the
+  weights. The weights are not part of this repository.
+- **The 2.9 bpw EXL3 pack family** — the checkpoint deployed here is the uncensored variant,
+  [`dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw`](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw);
+  the pack layout is
+  [Mia-AiLab's](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw). Quantisation family:
+  **exllamav3** by turboderp and contributors.
 
-* **jayleaton / deepseek-v41-tensorfold-spark** — https://github.com/jayleaton/deepseek-v41-tensorfold-spark
-  The two-Spark stack this deployment follows: the engine family implementation for DeepSeek-V4.1, the
-  prepared per-rank layout that makes sub-minute restarts possible, the benchmark workload definitions we
-  re-used verbatim, and the public issue discussion that fixed the packaging gaps and a host-memory growth
-  problem we hit on our own pair. Our deployment would have taken considerably longer without it.
+## Engine and recipe
 
-* **MiaAI-Lab** — https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks
-  The 2x DGX Spark vLLM kit that serves as the upstream baseline, and the publisher of the 2.9 bpw EXL3
-  pack family our checkpoint belongs to.
-
-* **ExLlamaV3 (turboderp-org)** — https://github.com/turboderp-org/exllamav3
-  The EXL3 quantisation format and its reference kernels.
-
-* **DeepSeek** — the model, its technical report, and the DSpark / Engram lines of work that the
-  speculative-decoding and n-gram paths in this stack implement.
-
-## Community references consulted
-
-* The DGX Spark / GB10 community working on unified-memory serving of large MoE models — the reasoning
-  about what fits in 128 GB of unified memory per node comes largely from public field reports, not from
-  our own theory.
+- **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart — the engine that serves this model: the EXL3
+  kernels, the server, and the drafting path everything here builds on. Pinned as a submodule in the recipe below.
+- **[jayleaton/deepseek-v41-tensorfold-spark](https://github.com/jayleaton/deepseek-v41-tensorfold-spark)** — the
+  two-Spark DeepSeek-V4.1 engine stack this deployment follows, including the exact speculative-decoding path,
+  bounded-replay prefill, the prepared per-rank layout that makes sub-minute restarts possible, and the benchmark
+  workload definitions whose prompt texts are quoted in the Performance section so the comparison is like-for-like.
+  The repository's public issue discussion also fixed the packaging gaps and a host-memory growth problem that this
+  pair hit. This deployment would have taken considerably longer without it.
+- **[MiaAI-Lab](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)** — the 2x DGX Spark vLLM kit
+  published as the baseline for the upstream tables, and the publisher of the 2.9 bpw EXL3 pack family.
+- The GB10 / DGX Spark community working on unified-memory serving of large MoE models — the reasoning about what
+  fits in 128 GB of unified memory per node comes largely from public field reports rather than our own theory.
 
 ## What this repository adds
 
-1. The **512K x 3 slot** profile and its measurements (single stream, 3-way aggregate, genuine 419,879-token
-   request with retrieval).
-2. The **slot-scaling fit ladder** on one pair: which context/slot combinations boot and which are refused,
-   with the exact refusal text.
-3. The **pool-versus-context** failure mode, with reproductions: the KV pool, not `max_model_len`, is what
-   refuses long requests.
-4. The **client-side comparison methodology** against an engine-internal benchmark, and why mixing the two
-   overstates the gap.
+1. The deployed **400,000 x 4** profile with client-side measurements: single stream, four-way aggregate, TTFT.
+2. The **window x slot fit ladder** on one pair, including the engine's refusal text for the combinations that do
+   not fit — and the observation that 500K caps at three slots.
+3. The **pool-versus-context** failure mode with reproductions: the KV pool, not `max_model_len`, refuses long
+   requests.
+4. The **thinking-default** finding: with the server's default effort, a bounded reply returns an empty `content`;
+   documented with the six-combination evidence and the per-request opt-in that restores it.
+5. A note on **client-side versus engine-internal measurement**, which is the difference that makes two published
+   sets of numbers look contradictory when they are not.
 
-Attribution request: if you build on this notes-style repository, please credit the upstream projects above
-as well — the ideas are theirs.
+If you build on this note, please credit the upstream projects above as well — the ideas are theirs.
